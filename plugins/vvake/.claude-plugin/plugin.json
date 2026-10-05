@@ -1,0 +1,11 @@
+{
+  "name": "vvake",
+  "displayName": "VVake",
+  "version": "0.1.0",
+  "description": "Lock Claude until you move: after a long stretch at the desk (90 min by default), prompts wait until you've moved 10 minutes. Always escapable: urgent:, /vvake:urgent, /vvake:skip, /vvake:unlock.",
+  "author": { "name": "VVake", "url": "https://vvake.com" },
+  "homepage": "https://vvake.com",
+  "repository": "https://github.com/vvake/claude-plugin",
+  "license": "MIT",
+  "keywords": ["wellbeing", "breaks", "focus", "fitness"]
+}

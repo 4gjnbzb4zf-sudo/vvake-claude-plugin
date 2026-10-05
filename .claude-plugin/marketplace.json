@@ -1,0 +1,12 @@
+{
+  "name": "vvake",
+  "description": "VVake for Claude Code: after a long stretch at the desk, Claude takes a break until you've moved.",
+  "owner": { "name": "VVake", "url": "https://vvake.com" },
+  "plugins": [
+    {
+      "name": "vvake",
+      "source": "./plugins/vvake",
+      "description": "Lock Claude until you move: desk time from your prompts, unlocked by a walk your VVake watch or phone logs. Urgent work always goes through."
+    }
+  ]
+}

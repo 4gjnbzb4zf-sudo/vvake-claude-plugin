@@ -1,0 +1,13 @@
+{
+  "name": "vvake-claude-plugin",
+  "private": true,
+  "version": "0.1.0",
+  "description": "VVake for Claude Code (plugin marketplace). No dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test plugins/vvake/test/*.test.mjs",
+    "validate": "claude plugin validate . && claude plugin validate ./plugins/vvake"
+  },
+  "engines": { "node": ">=18" }
+}

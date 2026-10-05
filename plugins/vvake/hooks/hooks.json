@@ -1,0 +1,16 @@
+{
+  "description": "VVake: desk time from prompt timestamps; after your rule, prompts wait until you've moved. Never blocks urgent: prompts or /vvake: commands.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
