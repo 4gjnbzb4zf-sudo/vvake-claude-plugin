@@ -9,11 +9,11 @@ unlocks it by itself. Urgent work always goes through, at once.
 In Claude Code:
 
 ```
-/plugin marketplace add vvake/claude-plugin
+/plugin marketplace add 4gjnbzb4zf-sudo/vvake-claude-plugin
 /plugin install vvake@vvake
 ```
 
-Or from your shell: `claude plugin marketplace add vvake/claude-plugin && claude plugin install vvake@vvake`.
+Or from your shell: `claude plugin marketplace add 4gjnbzb4zf-sudo/vvake-claude-plugin && claude plugin install vvake@vvake`.
 
 Needs Node.js 18 or later on your PATH (no other dependency). Without Node the plugin never locks anything and says
 so once.
