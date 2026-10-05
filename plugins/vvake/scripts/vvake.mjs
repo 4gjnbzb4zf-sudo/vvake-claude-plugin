@@ -150,12 +150,13 @@ async function pollOnce(p, timeoutMs = 3000) {
 function pairingText(p) {
   let qr = "";
   try {
-    qr = qrToTerminal(encodeQr(p.verifyUrl)) + "\n";
+    // The app's own link: the iPhone camera opens VVake directly, no website needed.
+    qr = qrToTerminal(encodeQr(p.appUrl || p.verifyUrl)) + "\n";
   } catch {}
   return [
     "VVake: scan to link your VVake (iPhone camera)",
     qr,
-    `Or open ${p.verifyUrl}`,
+    `No camera handy? Open ${p.verifyUrl} on your iPhone.`,
     `Code ${p.userCode}, valid until ${clock(p.expiresMs)}. Then just keep working, it links by itself.`,
     "Only desk minutes and timestamps are ever sent, never your code or prompts.",
     "No app? /vvake:link local locks after 90 min and unlocks after 10 min away.",
