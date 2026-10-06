@@ -285,7 +285,9 @@ export function onPrompt(prev, ctx) {
 function lockedText(view, left, awayCounts) {
   return [
     `Still ${left} min of moving and Claude is back.`,
-    awayCounts ? "A logged walk counts, so does time away from the keyboard." : "It unlocks by itself once your watch or phone logs the walk.",
+    awayCounts
+      ? "Any movement counts: a logged walk, steps on your iPhone, or time away from the keyboard."
+      : "Any movement counts: a walk, stairs, chores. It unlocks by itself once VVake sees it (a logged session, or your steps: open VVake on your iPhone).",
     escapesText(view),
   ].join("\n");
 }
