@@ -1,5 +1,5 @@
 ---
-description: "VVake: desk time, the rule, urgent mode"
+description: "VVake: desk time, the rule, postpones and skips left"
 allowed-tools: Bash(node:*)
 disable-model-invocation: true
 ---

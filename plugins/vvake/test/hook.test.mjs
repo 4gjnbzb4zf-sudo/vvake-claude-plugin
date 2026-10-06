@@ -17,11 +17,17 @@ const T0 = new Date(2026, 9, 5, 9, 0).getTime();
 const SECRET = "the secret prompt about payroll.ts";
 
 // ── Fake API ────────────────────────────────────────────────────────────────
+const freshLock = () => ({ requiredMin: 10, postponedUntil: null, clearedAt: null, postponesLeftToday: 3, skipsLeftThisWeek: 2, nextRequiredMin: 11, lastResortRequiredMin: 13, lastResortOnly: false });
 const api = {
   approved: false,
   movedMin: 0,
   busyUntil: null,
   revoked: false,
+  down: false,
+  /** The fake clock of the escapes (the hook's VVAKE_NOW_MS). */
+  nowMs: 0,
+  lock: freshLock(),
+  steps: 0,
   rule: { enabled: true, afterMin: 90, unlockMin: 10, overridesPerDay: 2, unlockBy: "move", warnMin: 10 },
   requests: [],
 };
@@ -39,6 +45,33 @@ before(async () => {
         res.end(data === undefined ? "" : JSON.stringify(data));
       };
       const authed = req.headers.authorization === "Bearer vvd_test_token_0123456789abcdef" && !api.revoked;
+      if (api.down && req.url.startsWith("/v1/desk/") && req.url !== "/v1/desk/pair" && req.url !== "/v1/desk/token") return send(503, { error: "server" });
+      const L = api.lock;
+      const cost = (n) => Math.ceil(10 * Math.pow(1.1, n) - 1e-9);
+      const price = () => Object.assign(L, { requiredMin: cost(api.steps), nextRequiredMin: cost(api.steps + 1), lastResortRequiredMin: cost(api.steps + 2), lastResortOnly: L.postponesLeftToday === 0 && L.skipsLeftThisWeek === 0 });
+      if (req.url === "/v1/desk/postpone" && authed) {
+        if (L.postponesLeftToday === 0) return send(409, { error: "conflict", reason: "no_postpones", lock: L });
+        const b = JSON.parse(body || "{}");
+        L.postponesLeftToday--;
+        api.steps++;
+        L.postponedUntil = new Date(api.nowMs + b.minutes * 60_000).toISOString();
+        return send(200, price());
+      }
+      if (req.url === "/v1/desk/skip" && authed) {
+        if (L.skipsLeftThisWeek === 0) return send(409, { error: "conflict", reason: "no_skips", lock: L });
+        L.skipsLeftThisWeek--;
+        L.clearedAt = new Date(api.nowMs).toISOString();
+        return send(200, price());
+      }
+      if (req.url === "/v1/desk/unlock" && authed) {
+        api.steps += 2;
+        L.clearedAt = new Date(api.nowMs).toISOString();
+        return send(200, price());
+      }
+      if (req.url === "/v1/desk/resume" && authed) {
+        L.postponedUntil = null;
+        return send(200, price());
+      }
       if (req.url === "/v1/desk/pair") {
         return send(200, { userCode: "X7K2-9QPM", deviceCode: "d".repeat(43), verifyUrl: "https://vvake.com/claude/X7K2-9QPM", appUrl: "vvake://claude/X7K2-9QPM", interval: 3, expiresIn: 600 });
       }
@@ -49,7 +82,7 @@ before(async () => {
       if (req.url === "/v1/desk/sync") {
         if (!authed) return send(401, { error: "unauthorized" });
         const b = JSON.parse(body || "{}");
-        return send(200, { rule: api.rule, busy: !!api.busyUntil, busyUntil: api.busyUntil, desk: { id: "desk-1", name: "Test Mac" }, ...(b.since ? { movedMin: api.movedMin } : {}) });
+        return send(200, { rule: api.rule, busy: !!api.busyUntil, busyUntil: api.busyUntil, desk: { id: "desk-1", name: "Test Mac" }, lock: api.lock, ...(b.since ? { movedMin: api.movedMin } : {}) });
       }
       if (req.url === "/v1/desk/token" && req.method === "DELETE") return send(204);
       send(404, { error: "not_found" });
@@ -75,6 +108,7 @@ function run(home, nowMs, args, stdin) {
 }
 
 async function prompt(home, nowMs, text, extra = {}) {
+  api.nowMs = nowMs;
   const out = await run(home, nowMs, ["hook"], JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s", prompt: text, ...extra }));
   return out ? JSON.parse(out) : null;
 }
@@ -108,7 +142,8 @@ describe("the hook, end to end", { concurrency: false }, () => {
     await prompt(home2, T0, SECRET);
     api.approved = true;
     const linked = await prompt(home2, T0 + 3 * MIN, SECRET);
-    assert.match(linked.systemMessage, /VVake linked \(Test Mac\)/);
+    // This computer's own name, never the API's copy of it (VV-08, test/validate.test.mjs).
+    assert.match(linked.systemMessage, /VVake linked \([^)\n]{1,40}\)/);
     const tok = join(home2, "claude", "token.json");
     assert.equal(statSync(tok).mode & 0o777, 0o600);
     assert.equal(JSON.parse(readFileSync(tok, "utf8")).token, "vvd_test_token_0123456789abcdef");
@@ -124,7 +159,8 @@ describe("the hook, end to end", { concurrency: false }, () => {
     const b = await workUntilBlocked(home, 0, 200);
     assert.equal(b.atMin, 92);
     assert.match(b.out.reason, /^92 min at the desk\. Move 10 minutes and Claude is back\./);
-    assert.match(b.out.reason, /Urgent\? Start your message with urgent: and Claude answers right away \(or \/vvake:urgent 2h\)\./);
+    assert.match(b.out.reason, /Urgent\? Start your message with urgent: \(postpones 30 min\) or \/vvake:urgent 1h · 3 postpones left today/);
+    assert.match(b.out.reason, /\/vvake:skip \(2 skips left this week\)/);
 
     api.movedMin = 6;
     const still = await prompt(home, T0 + 100 * MIN, SECRET);
@@ -135,8 +171,10 @@ describe("the hook, end to end", { concurrency: false }, () => {
     assert.match(back.systemMessage, /12 min of moving\. Nice\. Claude is back\./);
   });
 
-  it("urgent: passes through at once and starts urgent mode; /vvake:urgent off; status shows it", async () => {
+  it("urgent: is a 30-min postpone on the API (+10% next time), /vvake:urgent off ends it, then 3 a day", async () => {
     api.movedMin = 0;
+    api.lock = freshLock();
+    api.steps = 0;
     const home = freshHome();
     await prompt(home, T0 - 20 * MIN, "hello");
     await prompt(home, T0 - 19 * MIN, "hello");
@@ -145,26 +183,87 @@ describe("the hook, end to end", { concurrency: false }, () => {
     const t = T0 + (b.atMin + 1) * MIN;
     const u = await prompt(home, t, "urgent: the payment service is down");
     assert.equal(u.decision, undefined, "never blocked");
-    assert.match(u.systemMessage, /urgent mode until/);
-    for (let m = 2; m <= 94; m += 4) assert.equal((await prompt(home, t + m * MIN, SECRET))?.decision, undefined);
-    const status = await prompt(home, t + 96 * MIN, "/vvake:status");
+    assert.match(u.systemMessage, /Postponed 30 min: no lock until \d\d:\d\d\. Next unlock needs 11 min of moving instead of 10\. 2 postpones left today\./);
+    for (let m = 2; m <= 28; m += 4) assert.equal((await prompt(home, t + m * MIN, SECRET))?.decision, undefined);
+    const status = await prompt(home, t + 29 * MIN, "/vvake:status");
     assert.equal(status.decision, "block"); // commands are answered by the hook itself, Claude isn't called
-    assert.match(status.reason, /urgent until \d\d:\d\d, no lock/);
-    const off = await prompt(home, t + 97 * MIN, "/vvake:urgent off");
-    assert.match(off.reason, /^Urgent mode off/);
-    // Desk time kept counting: the next prompt after urgent mode ends is held again.
-    assert.equal((await prompt(home, t + 98 * MIN, SECRET))?.decision, "block");
-    const unlock = await prompt(home, t + 99 * MIN, "/vvake:unlock");
-    assert.match(unlock.reason, /^Unlocked/);
-    assert.equal((await prompt(home, t + 100 * MIN, SECRET))?.decision, undefined);
+    assert.match(status.reason, /postponed until \d\d:\d\d, no lock .* 2 postpones left today · 2 skips left this week/);
+    const off = await prompt(home, t + 29 * MIN, "/vvake:urgent off");
+    assert.match(off.reason, /^Postpone ended/);
+    // Desk time kept counting: the next prompt is held again, needing 11 min now.
+    assert.match((await prompt(home, t + 30 * MIN, SECRET))?.reason, /Move 11 minutes/);
+    const one = await prompt(home, t + 31 * MIN, "/vvake:urgent 1h");
+    assert.match(one.reason, /^Postponed 1 h: .* needs 13 min of moving instead of 11\. 1 postpone left today\./);
+    await prompt(home, t + 32 * MIN, "/vvake:urgent 4h");
+    const none = await prompt(home, t + 33 * MIN, "/vvake:urgent");
+    assert.match(none.reason, /^No postpones left today \(3 a day\)\. \/vvake:skip \(2 skips left this week\)/);
+    api.lock = freshLock();
+    api.steps = 0;
   });
 
-  it("urgent mode ends by itself; /vvake:urgent 30m", async () => {
+  it("skip: confirmed after 10 s, clears the lock; /vvake:unlock asks first while escapes remain, then always works", async () => {
+    api.movedMin = 0;
+    api.lock = freshLock();
+    api.steps = 0;
     const home = freshHome();
-    const r = await prompt(home, T0, "/vvake:urgent 30m");
-    assert.match(r.reason, /^Urgent mode on until 09:30/);
-    assert.match(await run(home, T0 + 29 * MIN, ["status"]), /urgent until 09:30/);
-    assert.doesNotMatch(await run(home, T0 + 31 * MIN, ["status"]), /urgent until/);
+    await prompt(home, T0 - 20 * MIN, "hello");
+    await prompt(home, T0 - 19 * MIN, "hello");
+    const b = await workUntilBlocked(home, 0, 200);
+    const t = T0 + (b.atMin + 1) * MIN;
+    const ask = await prompt(home, t, "/vvake:skip");
+    assert.match(ask.reason, /^Skip this lock without moving\? It uses 1 of your 2 skips left this week\. Take 10 seconds: \/vvake:skip again after \d\d:\d\d:\d\d/);
+    assert.match((await prompt(home, t + 4000, "/vvake:skip")).reason, /^6 s more/);
+    const done = await prompt(home, t + 12_000, "/vvake:skip");
+    assert.match(done.reason, /^Skipped\. Claude is back, desk time starts over\. 1 skip left this week\./);
+    assert.equal((await prompt(home, t + MIN, SECRET))?.decision, undefined);
+    // Locked again: /vvake:unlock lists what's left first.
+    const b2 = await workUntilBlocked(home, b.atMin + 2, b.atMin + 200);
+    const t2 = T0 + (b2.atMin + 1) * MIN;
+    const first = await prompt(home, t2, "/vvake:unlock");
+    assert.match(first.reason, /^The last resort costs the most: the next unlock would need 13 min of moving/);
+    assert.match(first.reason, /Really stuck\? \/vvake:unlock anyway/);
+    const anyway = await prompt(home, t2 + 1000, "/vvake:unlock anyway");
+    assert.match(anyway.reason, /^Unlocked \(last resort\)\. .* Next unlock needs 13 min of moving\./);
+    assert.equal((await prompt(home, t2 + MIN, SECRET))?.decision, undefined);
+    api.lock = freshLock();
+    api.steps = 0;
+  });
+
+  it("skipped from the phone (computer asleep): the next prompt goes through", async () => {
+    api.movedMin = 0;
+    api.lock = freshLock();
+    const home = freshHome();
+    await prompt(home, T0 - 20 * MIN, "hello");
+    await prompt(home, T0 - 19 * MIN, "hello");
+    const b = await workUntilBlocked(home, 0, 200);
+    api.lock = { ...freshLock(), clearedAt: new Date(T0 + (b.atMin + 5) * MIN).toISOString(), skipsLeftThisWeek: 1 };
+    const back = await prompt(home, T0 + (b.atMin + 30) * MIN, SECRET);
+    assert.equal(back.decision, undefined);
+    assert.match(back.systemMessage, /cleared from your phone/);
+    api.lock = freshLock();
+  });
+
+  it("offline: urgent: still postpones (counted on this computer), never blocked", async () => {
+    api.movedMin = 0;
+    api.lock = freshLock();
+    const home = freshHome();
+    await prompt(home, T0 - 20 * MIN, "hello");
+    await prompt(home, T0 - 19 * MIN, "hello");
+    const b = await workUntilBlocked(home, 0, 200);
+    api.down = true;
+    const u = await prompt(home, T0 + (b.atMin + 1) * MIN, "urgent: prod");
+    assert.equal(u.decision, undefined);
+    assert.match(u.systemMessage, /Postponed 30 min.*\(offline: counted on this computer\)/);
+    api.down = false;
+  });
+
+  it("local mode (no app): the same rules on this computer", async () => {
+    const home = freshHome();
+    await run(home, T0, ["link", "local"]);
+    const r = await prompt(home, T0, "/vvake:urgent 4h");
+    assert.match(r.reason, /^Postponed 4 h: no lock until 13:00\. Next unlock needs 11 min of moving instead of 10\. 2 postpones left today\.$/);
+    assert.match(await run(home, T0 + 239 * MIN, ["status"]), /postponed until 13:00/);
+    assert.doesNotMatch(await run(home, T0 + 241 * MIN, ["status"]), /postponed until/);
   });
 
   it("busyUntil from the phone is honoured: no lock while it lasts", async () => {
@@ -194,7 +293,11 @@ describe("the hook, end to end", { concurrency: false }, () => {
       assert.ok(!r.body.includes("payroll") && !r.body.includes("payment"), r.body);
       if (r.url === "/v1/desk/sync" && r.body) {
         const keys = Object.keys(JSON.parse(r.body)).sort();
-        assert.ok(keys.every((k) => ["deskMin", "lockedSince", "since"].includes(k)), keys.join(","));
+        assert.ok(keys.every((k) => ["deskMin", "lockedSince", "since", "tz"].includes(k)), keys.join(","));
+      }
+      if (["/v1/desk/postpone", "/v1/desk/skip", "/v1/desk/unlock", "/v1/desk/resume"].includes(r.url) && r.body) {
+        const keys = Object.keys(JSON.parse(r.body));
+        assert.ok(keys.every((k) => ["minutes", "tz"].includes(k)), keys.join(","));
       }
       if (r.url === "/v1/desk/pair") assert.deepEqual(Object.keys(JSON.parse(r.body)), ["name"]);
     }

@@ -1,5 +1,5 @@
 {
-  "description": "VVake: desk time from prompt timestamps; after your rule, prompts wait until you've moved. Never blocks urgent: prompts or /vvake: commands.",
+  "description": "VVake: desk time from prompt timestamps; after your rule, prompts wait until you've moved. Never blocks /vvake: commands; urgent: postpones the lock (3 a day).",
   "hooks": {
     "UserPromptSubmit": [
       {

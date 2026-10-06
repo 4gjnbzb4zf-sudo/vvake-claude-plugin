@@ -6,7 +6,7 @@
     {
       "name": "vvake",
       "source": "./plugins/vvake",
-      "description": "Lock Claude until you move: desk time from your prompts, unlocked by a walk your VVake watch or phone logs. Urgent work always goes through."
+      "description": "Lock Claude until you move: desk time from your prompts, unlocked by a walk your VVake watch or phone logs. Urgent work can always go through: postpone, skip, or a last-resort unlock, also from your phone or watch."
     }
   ]
 }

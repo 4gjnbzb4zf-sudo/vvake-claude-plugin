@@ -3,7 +3,7 @@
  * VVake for Claude Code: the UserPromptSubmit hook, the /vvake:* commands, the pairing poller and the lock watcher.
  *
  *   vvake.mjs hook                 the hook (JSON on stdin, JSON on stdout)
- *   vvake.mjs status|unlock|skip|link [local]|unlink|urgent [2h|30m|today|off]|help
+ *   vvake.mjs status|unlock [anyway]|skip|link [local]|unlink|urgent [30m|1h|4h|off]|help
  *   vvake.mjs poll | watch         background helpers (started by the hook, detached)
  *
  * Privacy: the prompt is read only to spot `/vvake:` commands and the `urgent:` prefix, here, on this machine. It is
@@ -19,29 +19,48 @@ import {
   DEFAULT_RULE,
   LOCAL_RULE,
   MIN,
+  NO_ESCAPES,
+  POSTPONES_PER_DAY,
+  SKIP_CONFIRM_MS,
+  SKIP_COUNTDOWN_S,
+  SKIPS_PER_WEEK,
+  URGENT_DEFAULT_MIN,
   URGENT_HINT,
   URGENT_PREFIX,
+  cleared,
   clock,
   deskMinutes,
-  emergencyUnlock,
+  escapeView,
   initialState,
+  label,
+  lastResortLocal,
   localDay,
   onPrompt,
   parseCommand,
-  parseDuration,
+  parsePostpone,
+  postponeLocal,
+  postponedUntil,
+  released,
+  remoteView,
   rollDay,
-  skip,
-  startUrgent,
+  skipLocal,
   statusLine,
-  stopUrgent,
-  urgentOn,
 } from "../lib/core.mjs";
 import { encodeQr, qrToTerminal } from "../lib/qr.mjs";
+import { isoOrNull, safeName, validId, validLock, validMinutes, validPairing, validRule, validToken } from "../lib/validate.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const API = (process.env.VVAKE_API || "https://vvake-api.val-54e.workers.dev").replace(/\/+$/, "");
 const DIR = join(process.env.VVAKE_HOME || join(homedir(), ".vvake"), "claude");
-const UA = "vvake-claude-plugin/0.1";
+const UA = "vvake-claude-plugin/0.2";
+/** The local day and week of the escapes are counted in this zone on the API too. */
+const TZ = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+  } catch {
+    return undefined;
+  }
+})();
 /** Tests only: a fixed clock. */
 const now = () => (process.env.VVAKE_NOW_MS ? Number(process.env.VVAKE_NOW_MS) : Date.now());
 const CACHE_MS = 5 * MIN;
@@ -72,7 +91,13 @@ const remove = (name) => rmSync(file(name), { force: true });
 const loadState = (t) => rollDay({ ...initialState(localDay(t)), ...readJson("state.json", {}) }, localDay(t));
 const saveState = (s) => writeJson("state.json", s);
 /** { token, deskId, name } in a 0600 file. */
-const loadToken = () => readJson("token.json");
+const loadToken = () => {
+  // VV-08: the name is shown to Claude; an old token.json may hold the API's copy of it, so it is cleaned here too.
+  const t = readJson("token.json");
+  return t && validToken(t.token) ? { ...t, name: safeName(t.name) ?? "this computer" } : null;
+};
+/** An ISO date from the API as ms, or null (VV-08: never echo what isn't a date). */
+const msOrNull = (v) => (isoOrNull(v) ? Date.parse(v) : null);
 const config = () => readJson("config.json", {});
 
 // ── API ────────────────────────────────────────────────────────────────────
@@ -91,22 +116,77 @@ async function api(method, path, { body, token, timeoutMs = 3000 } = {}) {
   return { status: res.status, data };
 }
 
-/** Rule + urgent / busy, cached 5 min; `report` sends desk minutes and the lock start (nothing else). */
+/**
+ * Rule + postpone + the escapes' counters (`lock`), cached 5 min; `report` sends desk minutes and the lock start
+ * (nothing else; plus the time zone the API counts local days in).
+ */
 async function remoteState(tok, { force = false, sinceMs = null, report = null } = {}) {
   const cache = readJson("cache.json");
   const t = now();
   if (!force && sinceMs === null && !report && cache && t - cache.fetchedMs < CACHE_MS) return { ...cache, ok: true, movedMin: null };
   try {
-    const body = { ...(sinceMs !== null ? { since: new Date(sinceMs).toISOString() } : {}), ...(report ?? {}) };
+    const body = { ...(sinceMs !== null ? { since: new Date(sinceMs).toISOString() } : {}), ...(report ?? {}), ...(TZ ? { tz: TZ } : {}) };
     const r = await api("POST", "/v1/desk/sync", { token: tok.token, body });
     if (r.status === 401) return { revoked: true };
     if (r.status !== 200 || !r.data?.rule) throw new Error(`sync ${r.status}`);
-    const fresh = { rule: { ...DEFAULT_RULE, ...r.data.rule }, busyUntilMs: r.data.busyUntil ? Date.parse(r.data.busyUntil) : null, name: r.data.desk?.name ?? tok.name, fetchedMs: t };
+    // VV-08: only checked values go on (they end up in Claude's context); the name is this computer's own.
+    const fresh = {
+      rule: { ...DEFAULT_RULE, ...validRule(r.data.rule) },
+      busyUntilMs: msOrNull(r.data.busyUntil),
+      lock: validLock(r.data.lock),
+      name: tok.name,
+      fetchedMs: t,
+    };
     writeJson("cache.json", fresh);
-    return { ...fresh, ok: true, movedMin: typeof r.data.movedMin === "number" ? r.data.movedMin : null };
+    return { ...fresh, ok: true, movedMin: validMinutes(r.data.movedMin) };
   } catch {
-    return { ...(cache ?? { rule: { ...DEFAULT_RULE }, busyUntilMs: null, name: tok.name }), ok: false, movedMin: null };
+    return { ...(cache ?? { rule: { ...DEFAULT_RULE }, busyUntilMs: null, lock: null, name: tok.name }), ok: false, movedMin: null };
   }
+}
+
+/** The escapes as the API counts them when linked (also offline, from the cache), else this computer's copy. */
+function viewFor(s, remote, t) {
+  const v = remote?.lock ? remoteView(remote.lock) : escapeView(s.esc ?? NO_ESCAPES, remote?.rule?.unlockMin ?? DEFAULT_RULE.unlockMin, t);
+  // Urgent / busy set on the API before postpones existed (or by an older app): no lock either.
+  if (remote?.busyUntilMs && remote.busyUntilMs > t) v.postponedUntilMs = Math.max(v.postponedUntilMs ?? 0, remote.busyUntilMs);
+  return v;
+}
+
+const ESCAPE_PATHS = { postpone: "/v1/desk/postpone", skip: "/v1/desk/skip", unlock: "/v1/desk/unlock", resume: "/v1/desk/resume" };
+
+/**
+ * One escape (postpone | skip | unlock | resume). Linked: the API's rules and counters (shared with the phone and the
+ * watch). Without the app, or when the API can't be reached: this computer's copy of the same rules, so an escape
+ * always works offline. Returns { ok, reason?, view, state, remote }.
+ */
+async function applyEscape(s, kind, minutes = null) {
+  const t = now();
+  const tok = loadToken();
+  if (tok) {
+    const body = { ...(kind === "postpone" ? { minutes } : {}), ...(TZ ? { tz: TZ } : {}) };
+    const r = await api("POST", ESCAPE_PATHS[kind], { token: tok.token, body }).catch(() => null);
+    if (r && (r.status === 200 || r.status === 409)) {
+      const lock = validLock(r.status === 200 ? r.data : r.data?.lock);
+      if (lock) {
+        const cache = readJson("cache.json");
+        if (cache) writeJson("cache.json", { ...cache, lock: { ...cache.lock, ...lock, clearedAt: cache.lock?.clearedAt ?? null } });
+      }
+      const view = lock ? remoteView(lock) : escapeView(s.esc, DEFAULT_RULE.unlockMin, t);
+      // Keep the postpone here too, so it holds even if the API is out of reach later.
+      const state = { ...s, esc: { ...s.esc, postponedUntilMs: kind === "resume" ? null : (view.postponedUntilMs ?? s.esc.postponedUntilMs) } };
+      const reason = typeof r.data?.reason === "string" && /^[a-z_]{1,40}$/.test(r.data.reason) ? r.data.reason : null;
+      return { ok: r.status === 200, reason, view, state, remote: true };
+    }
+  }
+  const rule = (tok ? readJson("cache.json")?.rule : null) ?? (config().local ? LOCAL_RULE : DEFAULT_RULE);
+  let esc = s.esc ?? NO_ESCAPES;
+  if (kind === "postpone" || kind === "skip") {
+    const r = kind === "postpone" ? postponeLocal(esc, minutes, t) : skipLocal(esc);
+    if (!r.ok) return { ok: false, reason: r.reason, view: escapeView(esc, rule.unlockMin, t), state: s, remote: false };
+    esc = r.state;
+  } else if (kind === "unlock") esc = lastResortLocal(esc);
+  else esc = { ...esc, postponedUntilMs: null };
+  return { ok: true, reason: null, view: escapeView(esc, rule.unlockMin, t), state: { ...s, esc, urgentUntilMs: kind === "resume" ? null : s.urgentUntilMs }, remote: false };
 }
 
 // ── Pairing ────────────────────────────────────────────────────────────────
@@ -124,10 +204,13 @@ function machineName() {
 /** The current pairing, or a new one (null when the API can't be reached). */
 async function ensurePairing() {
   const p = readJson("pairing.json");
-  if (p && p.expiresMs - now() > 60_000) return p;
+  if (p && p.expiresMs - now() > 60_000 && validPairing(p)) return p;
   const r = await api("POST", "/v1/desk/pair", { body: { name: machineName() } }).catch(() => null);
   if (!r || r.status !== 200) return null;
-  const fresh = { ...r.data, expiresMs: now() + r.data.expiresIn * 1000 };
+  // VV-08: the links and the code are shown to Claude: VVake's own links only, or nothing.
+  const valid = validPairing(r.data);
+  if (!valid) return null;
+  const fresh = { ...valid, expiresMs: now() + valid.expiresIn * 1000 };
   writeJson("pairing.json", fresh, 0o600);
   return fresh;
 }
@@ -136,9 +219,11 @@ async function ensurePairing() {
 async function pollOnce(p, timeoutMs = 3000) {
   const r = await api("POST", "/v1/desk/token", { body: { deviceCode: p.deviceCode }, timeoutMs }).catch(() => null);
   if (!r) return "pending";
-  if (r.status === 200 && r.data?.token) {
-    writeJson("token.json", { token: r.data.token, deskId: r.data.deskId, name: r.data.name }, 0o600);
-    writeJson("cache.json", { rule: { ...DEFAULT_RULE, ...r.data.rule }, busyUntilMs: r.data.busyUntil ? Date.parse(r.data.busyUntil) : null, name: r.data.name, fetchedMs: now() });
+  if (r.status === 200 && validToken(r.data?.token)) {
+    // VV-08: this computer's own name, not the API's copy of it (it is shown to Claude).
+    const name = safeName(machineName()) ?? "this computer";
+    writeJson("token.json", { token: r.data.token, deskId: validId(r.data.deskId), name }, 0o600);
+    writeJson("cache.json", { rule: { ...DEFAULT_RULE, ...validRule(r.data.rule) }, busyUntilMs: msOrNull(r.data.busyUntil), name, fetchedMs: now() });
     remove("pairing.json");
     return "linked";
   }
@@ -251,16 +336,27 @@ async function watchLoop() {
       }
       const tok = loadToken();
       let moved = 0;
+      let view = viewFor(s, tok ? cache : { rule }, now());
       if (tok && Date.now() - lastApi > 2 * MIN) {
         lastApi = Date.now();
-        const r = await api("GET", `/v1/desk/moved?since=${encodeURIComponent(new Date(s.lockedSinceMs).toISOString())}`, { token: tok.token }).catch(() => null);
-        if (r?.status === 200) moved = r.data.movedMin;
+        // The state since the lock: moved minutes, and a skip or a postpone made on the phone or the watch.
+        const q = `since=${encodeURIComponent(new Date(s.lockedSinceMs).toISOString())}${TZ ? `&tz=${encodeURIComponent(TZ)}` : ""}`;
+        const r = await api("GET", `/v1/desk/state?${q}`, { token: tok.token }).catch(() => null);
+        if (r?.status === 200) {
+          moved = validMinutes(r.data.movedMin) ?? 0;
+          const lock = validLock(r.data.lock);
+          if (lock && cache) writeJson("cache.json", { ...cache, lock, busyUntilMs: msOrNull(r.data.busyUntil) });
+          view = viewFor(s, { ...cache, rule, lock, busyUntilMs: msOrNull(r.data.busyUntil) }, now());
+        }
       }
       if (!cur.notified) {
-        if (moved >= rule.unlockMin) {
+        if (moved >= view.requiredMin) {
           notify(`${moved} min of moving. Claude is back.`);
           cur.notified = true;
-        } else if ((rule.unlockBy === "away" || !tok) && cur.keyboardAwayMin >= rule.unlockMin) {
+        } else if ((view.clearedAtMs !== null && view.clearedAtMs >= s.lockedSinceMs) || postponedUntil(s, now(), view) !== null) {
+          notify("Lock lifted from your phone. Claude is back.");
+          cur.notified = true;
+        } else if ((rule.unlockBy === "away" || !tok) && cur.keyboardAwayMin >= view.requiredMin) {
           notify("Break done. Claude is back when you are.");
           cur.notified = true;
         }
@@ -283,13 +379,47 @@ async function currentRule(tok) {
 
 const HELP = [
   "VVake for Claude Code: after a long stretch at the desk, Claude takes a break until you've moved.",
-  "/vvake:status       desk time, the rule, urgent mode",
-  "/vvake:urgent [2h|30m|today|off]   urgent work: no lock, no nudges (or start a message with urgent:)",
-  "/vvake:skip         one of today's skips: desk time starts over",
-  "/vvake:unlock       always works",
+  "/vvake:status       desk time, the rule, postpones and skips left",
+  "/vvake:urgent [30m|1h|4h|off]   postpone the lock (3 a day, each adds 10% of moving), or start a message with urgent:",
+  "/vvake:skip         skip this lock without moving (2 a week, confirm after 10 s)",
+  "/vvake:unlock       last resort, always works (costs more moving next time)",
   "/vvake:link         link your VVake app (QR code) · /vvake:link local to use it without the app",
   "/vvake:unlink       unlink this computer",
+  "Your phone and watch can postpone or skip too: VVake › Claude lock.",
 ].join("\n");
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const clockS = (ms) => `${clock(ms)}:${String(new Date(ms).getSeconds()).padStart(2, "0")}`;
+const offlineNote = (r) => (r.remote || !loadToken() ? "" : " (offline: counted on this computer)");
+
+/** The escapes as they are now (the API's when linked and reachable). */
+async function currentView(s, tok) {
+  const r = await currentRule(tok);
+  return { rule: r.rule, view: viewFor(s, tok ? r : { rule: r.rule }, now()) };
+}
+
+/** A postpone (/vvake:urgent, the urgent: prefix): text for the user. */
+async function postponeText(s, minutes, before) {
+  const r = await applyEscape(s, "postpone", minutes);
+  if (!r.ok) {
+    if (r.reason === "no_postpones") {
+      const v = r.view;
+      return {
+        state: r.state,
+        ok: false,
+        text: `No postpones left today (${POSTPONES_PER_DAY} a day). ${v.skipsLeftThisWeek > 0 ? `/vvake:skip (${plural(v.skipsLeftThisWeek, "skip")} left this week)` : "No skips left this week either"}, or the last resort /vvake:unlock.`,
+      };
+    }
+    return { state: r.state, ok: false, text: "Try /vvake:urgent 30m, /vvake:urgent 1h or /vvake:urgent 4h." };
+  }
+  const v = r.view;
+  const until = v.postponedUntilMs ?? now() + minutes * MIN;
+  return {
+    state: { ...released(r.state), urgentTotal: (r.state.urgentTotal ?? 0) + 1, skipAskedMs: null },
+    ok: true,
+    text: `Postponed ${label(minutes)}: no lock until ${clock(until)}. Next unlock needs ${v.requiredMin} min of moving instead of ${before}. ${plural(v.postponesLeftToday, "postpone")} left today.${offlineNote(r)}`,
+  };
+}
 
 export async function runCommand(cmd, arg) {
   const t = now();
@@ -308,33 +438,77 @@ export async function runCommand(cmd, arg) {
         text = "VVake: this computer was unlinked from the phone. /vvake:link to link it again.";
         break;
       }
-      text = statusLine(s, t, { rule: r.rule, busyUntilMs: r.busyUntilMs, linkedName: tok?.name ?? null, local: !tok, movedMin: r.movedMin ?? null });
+      text = statusLine(s, t, { rule: r.rule, view: viewFor(s, tok ? r : { rule: r.rule }, t), linkedName: tok?.name ?? null, local: !tok, movedMin: r.movedMin ?? null });
       if (tok && !r.ok) text += " · offline (time away counts too)";
       break;
     }
     case "unlock": {
-      const r = emergencyUnlock(s, t);
-      s = r.state;
-      text = r.text;
+      if (s.lockedSinceMs === null) {
+        text = `Not locked. ${deskMinutes(s, t)} min at the desk.`;
+        break;
+      }
+      const { view } = await currentView(s, tok);
+      const anyway = /^(anyway|now|quand[- ]m[eê]me|force)$/i.test(arg);
+      if (!view.lastResortOnly && !anyway) {
+        const opts = [];
+        if (view.postponesLeftToday > 0) opts.push(`/vvake:urgent 30m (${plural(view.postponesLeftToday, "postpone")} left today, next unlock ${view.nextRequiredMin} min)`);
+        if (view.skipsLeftThisWeek > 0) opts.push(`/vvake:skip (${plural(view.skipsLeftThisWeek, "skip")} left this week)`);
+        text = [
+          `The last resort costs the most: the next unlock would need ${view.lastResortRequiredMin} min of moving. You still have:`,
+          ...opts.map((o) => `- ${o}`),
+          "Really stuck? /vvake:unlock anyway",
+        ].join("\n");
+        break;
+      }
+      const r = await applyEscape(s, "unlock");
+      s = { ...cleared(r.state, t), unlocksToday: (r.state.unlocksToday ?? 0) + 1, unlocksTotal: (r.state.unlocksTotal ?? 0) + 1 };
+      text = `Unlocked (last resort). Claude is back, desk time starts over. Next unlock needs ${r.view.requiredMin} min of moving.${offlineNote(r)}`;
       break;
     }
     case "skip": {
-      const r = skip(s, t, (await currentRule(tok)).rule);
-      s = r.state;
-      text = r.text;
+      if (s.lockedSinceMs === null) {
+        text = "Not locked: nothing to skip. A skip clears a lock without moving (2 a week).";
+        break;
+      }
+      const { view } = await currentView(s, tok);
+      if (view.skipsLeftThisWeek <= 0) {
+        text = `No skips left this week (${SKIPS_PER_WEEK} a week). ${view.postponesLeftToday > 0 ? "/vvake:urgent 30m postpones it" : "Last resort: /vvake:unlock"}.`;
+        break;
+      }
+      const asked = s.skipAskedMs;
+      if (asked !== null && asked !== undefined && t - asked >= SKIP_COUNTDOWN_S * 1000 && t - asked <= SKIP_CONFIRM_MS) {
+        const r = await applyEscape(s, "skip");
+        if (!r.ok) {
+          s = { ...r.state, skipAskedMs: null };
+          text = `No skips left this week (${SKIPS_PER_WEEK} a week). Last resort: /vvake:unlock.`;
+          break;
+        }
+        s = { ...cleared(r.state, t), skipsTotal: (r.state.skipsTotal ?? 0) + 1 };
+        text = `Skipped. Claude is back, desk time starts over. ${plural(r.view.skipsLeftThisWeek, "skip")} left this week.${offlineNote(r)}`;
+        break;
+      }
+      if (asked !== null && asked !== undefined && t - asked < SKIP_COUNTDOWN_S * 1000) {
+        text = `${Math.ceil((SKIP_COUNTDOWN_S * 1000 - (t - asked)) / 1000)} s more, then /vvake:skip again to confirm.`;
+        break;
+      }
+      s = { ...s, skipAskedMs: t };
+      text = `Skip this lock without moving? It uses 1 of your ${plural(view.skipsLeftThisWeek, "skip")} left this week. Take ${SKIP_COUNTDOWN_S} seconds: /vvake:skip again after ${clockS(t + SKIP_COUNTDOWN_S * 1000)} (within 2 min) to confirm.`;
       break;
     }
     case "urgent":
     case "urgence": {
-      const d = parseDuration(arg, t);
+      const d = parsePostpone(arg);
       if (d === "off") {
-        s = stopUrgent(s);
-        text = "Urgent mode off. Desk time keeps counting from here.";
+        const r = await applyEscape(s, "resume");
+        s = r.state;
+        text = "Postpone ended. Desk time keeps counting from here.";
       } else if (d === null) {
-        text = "Try /vvake:urgent 2h, /vvake:urgent 30m, /vvake:urgent today or /vvake:urgent off.";
+        text = "Try /vvake:urgent 30m, /vvake:urgent 1h, /vvake:urgent 4h or /vvake:urgent off.";
       } else {
-        s = startUrgent(s, t, d);
-        text = `Urgent mode on until ${clock(s.urgentUntilMs)}. No lock, no nudges. Go. (/vvake:urgent off when done)`;
+        const { view } = await currentView(s, tok);
+        const r = await postponeText(s, d, view.requiredMin);
+        s = r.state;
+        text = r.text;
       }
       break;
     }
@@ -362,7 +536,7 @@ export async function runCommand(cmd, arg) {
       if (tok) await api("DELETE", "/v1/desk/token", { token: tok.token }).catch(() => null);
       for (const f of ["token.json", "cache.json", "pairing.json", "watch.json"]) remove(f);
       writeJson("config.json", { ...config(), local: false });
-      s = { ...s, lockedSinceMs: null, lastAttemptMs: null, awayMaxMin: 0, linkShownMs: t, linkedAnnounced: false };
+      s = { ...s, lockedSinceMs: null, lastAttemptMs: null, awayMaxMin: 0, linkShownMs: t, linkedAnnounced: false, skipAskedMs: null };
       text = "Unlinked. Nothing locks any more. /vvake:link to link again.";
       break;
     }
@@ -391,9 +565,17 @@ export async function hook(input) {
 
   let s = loadState(t);
   if (URGENT_PREFIX.test(prompt)) {
-    s = startUrgent(s, t);
-    saveState(s);
-    return { systemMessage: `VVake: urgent mode until ${clock(s.urgentUntilMs)}. No lock, no nudges.` };
+    // Not linked and not local: nothing ever locks, nothing to postpone.
+    if (!loadToken() && !config().local) return null;
+    const { view } = await currentView(s, loadToken());
+    const locked = s.lockedSinceMs !== null && postponedUntil(s, t, view) === null;
+    // Already postponed: the prompt just goes through.
+    if (postponedUntil(s, t, view) !== null) return null;
+    const r = await postponeText(s, URGENT_DEFAULT_MIN, view.requiredMin);
+    saveState(r.state);
+    if (r.ok) return { systemMessage: `VVake: ${r.text}` };
+    // No postpone left: a lock stays (the skip and the last resort are still there); no lock, the prompt goes through.
+    return locked ? { decision: "block", reason: `urgent: can't postpone any more today. ${r.text}` } : { systemMessage: `VVake: ${r.text}` };
   }
   // Only a prompt you type starts or is held by a lock; turns Claude starts on its own pass through.
   if (input?.is_continuation) return null;
@@ -423,7 +605,7 @@ export async function hook(input) {
     }
   }
 
-  let remote = { rule: LOCAL_RULE, busyUntilMs: null, ok: true, movedMin: null };
+  let remote = { rule: LOCAL_RULE, busyUntilMs: null, lock: null, ok: true, movedMin: null };
   if (tok) {
     const desk = deskMinutes(s, t);
     const cache = readJson("cache.json");
@@ -444,7 +626,7 @@ export async function hook(input) {
   const out = onPrompt(s, {
     nowMs: t,
     rule: remote.rule,
-    busy: remote.busyUntilMs !== null && remote.busyUntilMs > t,
+    view: viewFor(s, remote, t),
     movedMin: remote.movedMin,
     keyboardAwayMin: keyboardAway(s),
     awayCounts: !tok || !remote.ok || remote.rule.unlockBy === "away",
@@ -455,7 +637,7 @@ export async function hook(input) {
   if (tok && remote.ok && isLocked !== wasLocked) {
     await api("POST", "/v1/desk/sync", {
       token: tok.token,
-      body: { deskMin: Math.min(deskMinutes(out.state, t), 1440), lockedSince: isLocked ? new Date(out.state.lockedSinceMs).toISOString() : null },
+      body: { deskMin: Math.min(deskMinutes(out.state, t), 1440), lockedSince: isLocked ? new Date(out.state.lockedSinceMs).toISOString() : null, ...(TZ ? { tz: TZ } : {}) },
       timeoutMs: 2000,
     }).catch(() => null);
   }
